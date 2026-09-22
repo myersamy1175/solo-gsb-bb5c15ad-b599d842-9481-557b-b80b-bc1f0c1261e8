@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    image: sample-lineage-api:latest
+    container_name: sample-lineage-api
+    ports:
+      - "8000:8000"
+    environment:
+      SAMPLE_DB_PATH: /data/samples.db
+      BALANCE_TOLERANCE: "1e-6"
+    volumes:
+      - sample-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sample-data:
