@@ -409,14 +409,16 @@ def _persist_plan(
     for sid, material, unit, initial, remaining, loc, is_root in plan.new_samples:
         conn.execute(
             "INSERT INTO samples (sample_id, material, unit, initial_amount,"
-            " remaining, location, is_root) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " remaining, location, is_root, version) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
             (sid, material, unit, initial, remaining, loc, is_root),
         )
     for sid, delta in plan.deltas.items():
         if abs(delta) < _EPS:
             continue
+        # version 随余量变更递增,供盘点等场景做乐观并发校验
         conn.execute(
-            "UPDATE samples SET remaining = remaining + ? WHERE sample_id = ?",
+            "UPDATE samples SET remaining = remaining + ?, version = version + 1"
+            " WHERE sample_id = ?",
             (_r(delta), sid),
         )
 
@@ -706,6 +708,8 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
     - 非根样品:Σin − Σout(全部来自谱系转移)
     - 根样品(取样):initial_amount 即外部来源,取样的那条 in 流水与它同源,
       重算时排除,避免双算;之后仍可能被其他样品并入(Σin)。
+    - 盘点确认的调整流水(stocktake_adjustments)是余量重算的另一来源:
+      正差异(盘盈)视为 in、负差异(盘亏)视为 out,与谱系流水合并。
     """
     smp = conn.execute(
         "SELECT initial_amount, is_root FROM samples WHERE sample_id = ?",
@@ -720,9 +724,14 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
               AND NOT (? = 1 AND edge_id IS NULL)""",
         (sample_id, 1 if is_root else 0),
     ).fetchone()
+    adj = conn.execute(
+        "SELECT COALESCE(SUM(variance), 0) AS sadj FROM stocktake_adjustments"
+        " WHERE sample_id = ?",
+        (sample_id,),
+    ).fetchone()
     source = smp["initial_amount"] if is_root else 0.0
     tin, tout = _r(row["tin"]), _r(row["tout"])
-    return tin, tout, _r(source + tin - tout)
+    return tin, tout, _r(source + tin - tout + adj["sadj"])
 
 
 def get_balance(

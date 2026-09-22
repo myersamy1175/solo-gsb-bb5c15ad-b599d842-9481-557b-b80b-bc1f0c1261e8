@@ -6,6 +6,7 @@ from typing import Annotated, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 Amount = Annotated[float, Field(gt=0, description="必须为正数的质量/体积")]
+NonNegAmount = Annotated[float, Field(ge=0, description="非负数量,如实盘余量允许为 0")]
 
 
 # ---------------------------------------------------------------- 操作请求
@@ -249,3 +250,100 @@ class SampleAvailability(BaseModel):
 
 class AvailabilityResponse(BaseModel):
     samples: list[SampleAvailability]
+
+
+# ---------------------------------------------------------------- 盘点
+
+class StocktakeItemIn(BaseModel):
+    """新建盘点批次时指定的盘点样品(余量与版本由服务端快照)。"""
+
+    sample_id: str = Field(min_length=1)
+
+
+class StocktakeBatchRequest(BaseModel):
+    """新建盘点批次:在同一事务内为样品集合保存当时的余量/版本快照。"""
+
+    batch_no: str = Field(min_length=1, description="盘点批次号(幂等键),全局唯一")
+    sample_ids: list[str] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+
+    @model_validator(mode="after")
+    def _check_samples(self) -> "StocktakeBatchRequest":
+        if len(self.sample_ids) != len(set(self.sample_ids)):
+            raise ValueError("sample_ids 中存在重复 sample_id")
+        return self
+
+
+class StocktakeCountItem(BaseModel):
+    """逐项实盘结果。"""
+
+    sample_id: str = Field(min_length=1)
+    counted_amount: NonNegAmount
+
+
+class StocktakeCountRequest(BaseModel):
+    """提交盘点结果:逐项校验样品仍存在且余量版本未被其他操作改变。"""
+
+    batch_no: str = Field(min_length=1)
+    items: list[StocktakeCountItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "StocktakeCountRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class StocktakeConfirmRequest(BaseModel):
+    """确认盘点:事务内再次校验版本,写入调整流水并更新样品余量。"""
+
+    batch_no: str = Field(min_length=1)
+    operator: str = Field(min_length=1, description="操作者(确认人),写入调整流水")
+    reason: str = Field(min_length=1, description="盘点原因/说明,写入调整流水")
+
+
+class StocktakeItemOut(BaseModel):
+    sample_id: str
+    unit: str
+    snapshot_remaining: float = Field(description="创建批次时的余量快照(盘点时认定的系统量)")
+    snapshot_version: int = Field(description="创建批次时的余量版本")
+    current_remaining: Optional[float] = Field(
+        default=None, description="查询时刻的数据库余量(未提交结果时为 None)"
+    )
+    current_version: Optional[int] = Field(
+        default=None, description="查询时刻的余量版本(未提交结果时为 None)"
+    )
+    counted_amount: Optional[float] = Field(default=None, description="实盘量(未提交时为 None)")
+    system_remaining: Optional[float] = Field(
+        default=None, description="提交实盘结果时的数据库余量(未提交时为 None)"
+    )
+    system_version: Optional[int] = Field(
+        default=None, description="提交实盘结果时的余量版本(未提交时为 None)"
+    )
+    variance: Optional[float] = Field(
+        default=None,
+        description="差异 = 实盘量 - 系统量(提交后按最新系统量计算;未提交时为 None)",
+    )
+    changed_since_snapshot: Optional[bool] = Field(
+        default=None,
+        description="提交后余量版本是否已偏离快照版本(未提交结果时为 None)",
+    )
+    final_remaining: Optional[float] = Field(
+        default=None, description="确认调整后的样品余量(未确认时为 None)"
+    )
+
+
+class StocktakeBatchResponse(BaseModel):
+    batch_no: str
+    status: Literal["open", "counted", "confirmed"]
+    items: list[StocktakeItemOut]
+    note: Optional[str] = None
+    operator: Optional[str] = None
+    reason: Optional[str] = None
+    replayed: bool = Field(
+        default=False, description="True 表示命中批次号幂等,返回首次结果"
+    )
+    created_at: Optional[str] = None
+    counted_at: Optional[str] = None
+    confirmed_at: Optional[str] = None

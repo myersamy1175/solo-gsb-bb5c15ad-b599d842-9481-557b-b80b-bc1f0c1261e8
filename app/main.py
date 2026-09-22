@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from . import schemas as s
 from . import reservations as rsv
 from . import service
+from . import stocktake as stk
 from .config import BALANCE_TOLERANCE, DB_PATH
 from .db import connect, get_conn, init_db
 
@@ -37,7 +38,11 @@ app = FastAPI(
         "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
         "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
         "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
-        "  支持按预留号幂等重放与整单释放"
+        "  支持按预留号幂等重放与整单释放\n"
+        "- 盘点模块:按样品集合在同一事务保存余量/版本快照,\n"
+        "  提交实盘结果逐项校验版本并计算差异,\n"
+        "  确认时单事务再次校验版本、写入盘点调整流水并更新余量,\n"
+        "  任一冲突整批不改库存;批次号支持幂等重放"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -65,6 +70,23 @@ async def reservation_error_handler(
         status_code=status_code,
         content={
             "error": "reservation_not_found" if status_code == 404 else "conflict",
+            "conflicts": [c.model_dump() for c in exc.conflicts],
+        },
+    )
+
+
+@app.exception_handler(stk.StocktakeError)
+async def stocktake_error_handler(
+    _request, exc: stk.StocktakeError
+) -> JSONResponse:
+    code = exc.conflicts[0].code if exc.conflicts else "stocktake_error"
+    status_code = 404 if code == "stocktake_batch_not_found" else 409
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": (
+                "stocktake_batch_not_found" if status_code == 404 else "conflict"
+            ),
             "conflicts": [c.model_dump() for c in exc.conflicts],
         },
     )
@@ -383,3 +405,79 @@ def query_availability(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> s.AvailabilityResponse:
     return rsv.get_availability(conn, sample_id)
+
+
+# ---------------------------------------------------------------- 盘点
+
+@app.post(
+    "/api/v1/stocktakes",
+    response_model=s.StocktakeBatchResponse,
+    tags=["盘点"],
+    summary="新建盘点批次:同一事务为样品集合保存余量/版本快照(按批次号幂等)",
+)
+def create_stocktake_batch(
+    body: s.StocktakeBatchRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.StocktakeBatchResponse:
+    return stk.create_batch(conn, body)
+
+
+@app.post(
+    "/api/v1/stocktakes/{batch_no}/results",
+    response_model=s.StocktakeBatchResponse,
+    tags=["盘点"],
+    summary="提交实盘结果:逐项校验样品仍存在且余量版本未变,计算系统量与实盘量差异",
+)
+def submit_stocktake_results(
+    batch_no: str,
+    body: s.StocktakeCountRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.StocktakeBatchResponse:
+    if body.batch_no != batch_no:
+        raise stk.StocktakeError([
+            s.Conflict(
+                code="stocktake_batch_conflict",
+                message=(
+                    f"路径批次号 {batch_no} 与请求体批次号 {body.batch_no} 不一致"
+                ),
+                op_no=batch_no,
+            )
+        ])
+    return stk.submit_results(conn, body)
+
+
+@app.post(
+    "/api/v1/stocktakes/{batch_no}/confirm",
+    response_model=s.StocktakeBatchResponse,
+    tags=["盘点"],
+    summary="确认盘点:单事务再次校验版本,写盘点调整流水并更新余量,任一冲突整批不改库存",
+)
+def confirm_stocktake_batch(
+    batch_no: str,
+    body: s.StocktakeConfirmRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.StocktakeBatchResponse:
+    if body.batch_no != batch_no:
+        raise stk.StocktakeError([
+            s.Conflict(
+                code="stocktake_batch_conflict",
+                message=(
+                    f"路径批次号 {batch_no} 与请求体批次号 {body.batch_no} 不一致"
+                ),
+                op_no=batch_no,
+            )
+        ])
+    return stk.confirm_batch(conn, body)
+
+
+@app.get(
+    "/api/v1/stocktakes/{batch_no}",
+    response_model=s.StocktakeBatchResponse,
+    tags=["盘点"],
+    summary="查询盘点批次:余量快照、实盘量、系统量、差异与确认状态",
+)
+def get_stocktake_batch(
+    batch_no: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.StocktakeBatchResponse:
+    return stk.get_batch(conn, batch_no)

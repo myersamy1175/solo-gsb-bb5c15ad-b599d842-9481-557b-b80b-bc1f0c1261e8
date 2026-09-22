@@ -1,6 +1,6 @@
 # 科研样品分装追溯 API
 
-基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并**三类操作,在数据库事务中完成余量校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。此外提供**预留模块**:客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询。
+基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并**三类操作,在数据库事务中完成余量校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。此外提供**预留模块**:客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询。**盘点模块**:按样品编号集合在同一事务保存盘点时的余量/版本快照,提交实盘结果时逐项校验样品仍存在且数据库余量未被其他操作改变并计算差异,确认批次时在一个事务内再次校验版本、写入盘点调整流水(带操作者与原因)并更新样品余量,任一冲突整批不改库存。
 
 ## 一键启动
 
@@ -43,6 +43,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 预留单 | 一个预留号(`reservation_no`)为多个样品分别锁定数量;`active`=锁定中,`released`=已整单释放 |
 | 已预留量 / 可用量 | 已预留量 = 该样品全部未释放预留的锁定合计;**可用量 = 当前余量 − 已预留量** |
 | 预留审计事件 | 预留、幂等重放、释放与查询的结果快照均写入 `reservation_events`,随数据库持久化 |
+| 盘点批次 `stocktake_no` | **盘点批次号(幂等键)**;状态机 `open`(已存快照)→ `counted`(已提交实盘结果)→ `confirmed`(已确认并调整库存) |
+| 余量版本 `version` | `samples.version` 乐观版本号,初始为 0;取样/分装/合并/盘点确认等一切余量写操作都令其 +1 |
+| 盘点快照 | 建批次时在同一事务记录各样品的余量与版本;提交实盘结果、确认批次都以快照版本判断余量是否被其他操作改变 |
+| 系统量 / 实盘量 / 差异 | 系统量 = 提交/确认时点的数据库余量;实盘量 = 现场盘点数量;**差异 variance = 实盘量 − 系统量**(正为盘盈、负为盘亏) |
+| 盘点调整流水 | 确认时逐项写入 `stocktake_adjustments`(差异为 0 也留痕),带操作者与原因;余量账本重算自动包含盘点差异 |
 
 **事务保证**
 
@@ -57,6 +62,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 同一预留号 + 同一请求体重放返回首次结果(`replayed: true`),不重复锁定;同号不同内容返回 `409 reservation_no_conflict`;对已释放预留号再次创建返回 `409 reservation_closed`。
 - `DELETE` 整单释放后锁定量立即归还,可被新预留使用;重复释放幂等;预留明细在释放后保留作为审计痕迹。
 - 预留不改动样品余量与出入库流水,仅通过"未释放预留合计"影响可用量。
+
+**盘点事务保证**
+
+- 新建批次(`POST /api/v1/stocktakes`):在单个 `BEGIN IMMEDIATE` 事务内校验样品集合全部存在,并保存各样品盘点时的余量与版本快照;任一样品不存在则整批失败、不建批次。
+- 提交实盘结果(`POST .../results`):逐项校验①样品仍存在;②数据库余量版本与快照一致(即盘点期间余量未被取样/分装/合并/其他盘点确认改变);提交的样品集合必须与批次快照**一致(与顺序无关,按样品号匹配)**,多出或缺失样品返回 `stocktake_items_mismatch`。全部通过才把实盘量、当时系统量落库(状态 `open → counted`)并给出差异;任一冲突则批次保持 `open`、不记录任何实盘结果。
+- 确认批次(`POST .../confirm`):在**一个事务内再次**逐项校验版本(二次校验防止"提交后、确认前"的并发修改),全部无冲突才:逐项写入 `stocktake_adjustments` 调整流水(含快照量、系统量、实盘量、差异、操作者、原因),按差异更新样品余量并递增版本(差异为 0 时余量与版本不变,但仍写流水留痕);**任一项冲突则整批回滚,所有样品库存都不改变**。
+- 盘点批次号是幂等键:同号 + 同请求体重放返回首次结果(`replayed: true`);同号不同内容返回 `409 stocktake_batch_conflict`。实盘结果与确认请求(操作者/原因)分别做幂等比对。
+- 冲突可恢复:版本冲突后该批次无法再提交/确认(版本只增不减),需用**新批次号**重新建批次盘点;已确认批次不能再提交结果。
+- 查询(`GET /api/v1/stocktakes/{batch_no}`)返回快照、当前余量、实盘量、提交时系统量、差异、是否发生过版本漂移、确认后余量与时间戳。
+- 旧库自动迁移:新表与 `samples.version` 列由启动时的增量迁移(`schema_migrations` 记录版本,首个迁移 `0001_stocktake`)自动补齐,Docker 卷中的历史数据可直接升级。
 
 ## API 一览
 
@@ -77,6 +92,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET  | `/api/v1/reservations?sample_id=...` | 查询样品当前余量 / 已预留量 / 可用量(可重复传参,不传返回全部) |
 | GET  | `/api/v1/reservations/{reservation_no}` | 按预留号查询预留单 |
 | DELETE | `/api/v1/reservations/{reservation_no}` | 整单释放预留(按预留号幂等) |
+| POST | `/api/v1/stocktakes` | 新建盘点批次:单事务保存样品集合的余量/版本快照(按批次号幂等) |
+| POST | `/api/v1/stocktakes/{batch_no}/results` | 提交实盘结果:逐项版本校验并计算系统量与实盘量差异 |
+| POST | `/api/v1/stocktakes/{batch_no}/confirm` | 确认盘点:单事务再次校验版本、写调整流水并更新余量,任一冲突整批不改库存 |
+| GET  | `/api/v1/stocktakes/{batch_no}` | 查询盘点批次:快照、实盘量、系统量、差异与确认状态 |
 | GET  | `/api/v1/operations/{op_no}` | 按操作号取首次提交的原始结果(幂等凭证) |
 | GET  | `/health` | 健康检查 |
 
@@ -266,6 +285,48 @@ curl -X DELETE http://localhost:8000/api/v1/reservations/RSV-20260922-001
 
 预留、重放、释放与查询事件均持久化在 `reservation_events` 表(含结果快照),新表随容器启动时的数据库初始化自动创建,数据保存在 Docker 卷 `sample-data` 中。
 
+### 11. 盘点:快照 → 实盘 → 确认调整
+
+```bash
+# ① 新建盘点批次:同一事务为样品集合保存余量/版本快照
+curl -X POST http://localhost:8000/api/v1/stocktakes \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_no": "STK-20260922-001",
+       "note": "冷库月度盘点",
+       "sample_ids": ["S0", "A1"]}'
+```
+
+返回每一项的 `snapshot_remaining` / `snapshot_version`(此时 `status: open`)。同一批次号用完全相同的请求体重放返回首次结果且 `replayed: true`;同号不同内容返回 `409 stocktake_batch_conflict`。
+
+```bash
+# ② 提交实盘结果:逐项校验样品仍存在且余量版本与快照一致
+curl -X POST http://localhost:8000/api/v1/stocktakes/STK-20260922-001/results \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_no": "STK-20260922-001",
+       "items": [{"sample_id": "S0", "counted_amount": 8},
+                 {"sample_id": "A1", "counted_amount": 62}]}'
+```
+
+通过后 `status: counted`,每项给出 `system_remaining`(提交时数据库余量)与 `variance`(实盘量 − 系统量),并以 `changed_since_snapshot` 标注建批次到提交之间余量是否被改动过。若盘点期间某样品余量被其他操作改变(版本不一致),返回 `409 stocktake_version_conflict`,冲突体附 `requested`(快照余量)与 `available`(当前余量),批次保持 `open`,需用**新批次号**重新盘点。
+
+```bash
+# ③ 确认:一个事务内再次校验版本,写盘点调整流水并更新余量
+curl -X POST http://localhost:8000/api/v1/stocktakes/STK-20260922-001/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_no": "STK-20260922-001",
+       "operator": "李四",
+       "reason": "2026-09 月度盘点,盘亏记损耗"}'
+```
+
+确认后 `status: confirmed`,每项给出 `final_remaining`;`stocktake_adjustments` 中逐项保留快照量、系统量、实盘量、差异、操作者与原因(差异为 0 也留痕)。若"提交结果后、确认前"任一样品余量又被改动,确认返回 `409` 且**整批回滚——所有样品库存都不变**。相同请求体重复确认返回首次结果且 `replayed: true`(不重复写流水)。
+
+```bash
+# ④ 查询:快照、实盘量、系统量、差异、版本漂移与确认状态
+curl http://localhost:8000/api/v1/stocktakes/STK-20260922-001
+```
+
+盘点调整纳入余量账本重算,确认后 `/api/v1/checks/balances` 仍保持 `consistent: true`。盘点表与 `samples.version` 列通过启动时的增量迁移自动创建,历史 Docker 卷可平滑升级。
+
 ## 冲突码
 
 | code | 含义 |
@@ -285,6 +346,10 @@ curl -X DELETE http://localhost:8000/api/v1/reservations/RSV-20260922-001
 | `reservation_no_conflict` | 预留号已存在但请求内容不同 |
 | `reservation_closed` | 预留号已释放,不能再次创建 |
 | `reservation_not_found` | 预留号不存在(查询/释放时返回 HTTP 404) |
+| `stocktake_batch_not_found` | 盘点批次号不存在(查询/提交/确认时返回 HTTP 404) |
+| `stocktake_batch_conflict` | 盘点批次号已存在但请求内容不同、批次状态不允许当前操作,或路径/请求体批次号不一致 |
+| `stocktake_items_mismatch` | 提交的样品集合(含顺序)与批次快照不一致 |
+| `stocktake_version_conflict` | 样品余量版本已偏离快照版本——数据库余量被其他操作改变;附 `requested`(快照余量)/`available`(当前余量) |
 
 ## 运行测试
 
@@ -298,14 +363,16 @@ python -m pytest -q
 ```
 app/
   config.py        # 数据库路径、容差等配置
-  db.py            # SQLite 连接 / 建表(WAL、外键、CHECK 约束、预留表)
-  schemas.py       # Pydantic 请求与响应模型(含冲突结构与预留模型)
-  service.py       # 核心:事务提交、余量/环路校验、幂等回放、dry-run、递归回溯、账本审计
+  db.py            # SQLite 连接 / 建表(WAL、外键、CHECK 约束、预留表)与增量迁移(schema_migrations)
+  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留与盘点模型)
+  service.py       # 核心:事务提交、余量/环路校验、幂等回放、dry-run、递归回溯、账本审计、余量版本
   reservations.py  # 预留:单事务多样品锁定、幂等重放、整单释放、可用量查询、事件审计
+  stocktake.py     # 盘点:批次快照、实盘版本校验/差异计算、确认调整流水、单事务整批回滚
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
   test_reservations.py # 预留模块端到端/并发/审计测试
+  test_stocktake.py    # 盘点模块端到端/并发/旧库迁移测试
 Dockerfile
 docker-compose.yml
 ```
