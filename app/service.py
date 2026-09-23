@@ -416,7 +416,8 @@ def _persist_plan(
         if abs(delta) < _EPS:
             continue
         conn.execute(
-            "UPDATE samples SET remaining = remaining + ? WHERE sample_id = ?",
+            "UPDATE samples SET remaining = remaining + ?, version = version + 1"
+            " WHERE sample_id = ?",
             (_r(delta), sid),
         )
 
@@ -706,6 +707,8 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
     - 非根样品:Σin − Σout(全部来自谱系转移)
     - 根样品(取样):initial_amount 即外部来源,取样的那条 in 流水与它同源,
       重算时排除,避免双算;之后仍可能被其他样品并入(Σin)。
+    - 盘点调整(stocktake_adjustments.delta,可正可负)作为非谱系流水一并计入,
+      因此实盘确认改账后冗余余量仍可与账本重算对齐。
     """
     smp = conn.execute(
         "SELECT initial_amount, is_root FROM samples WHERE sample_id = ?",
@@ -720,9 +723,15 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
               AND NOT (? = 1 AND edge_id IS NULL)""",
         (sample_id, 1 if is_root else 0),
     ).fetchone()
+    adj = conn.execute(
+        "SELECT COALESCE(SUM(delta), 0) AS d FROM stocktake_adjustments"
+        " WHERE sample_id = ?",
+        (sample_id,),
+    ).fetchone()
     source = smp["initial_amount"] if is_root else 0.0
     tin, tout = _r(row["tin"]), _r(row["tout"])
-    return tin, tout, _r(source + tin - tout)
+    adjustments = _r(adj["d"])
+    return tin, tout, _r(source + tin - tout + adjustments)
 
 
 def get_balance(
@@ -736,6 +745,11 @@ def get_balance(
         ])
     tin, tout, ledger_rem = _ledger_remaining(conn, sample_id)
     stored = _r(smp["remaining"])
+    adj_row = conn.execute(
+        "SELECT COALESCE(SUM(delta), 0) AS d FROM stocktake_adjustments"
+        " WHERE sample_id = ?",
+        (sample_id,),
+    ).fetchone()
     return s.SampleBalance(
         sample_id=sample_id,
         unit=smp["unit"],
@@ -744,6 +758,7 @@ def get_balance(
         consistent=abs(stored - ledger_rem) <= tolerance,
         total_in=tin,
         total_out=tout,
+        adjustments=_r(adj_row["d"]),
         available=stored,
     )
 

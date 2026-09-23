@@ -169,6 +169,9 @@ class SampleBalance(BaseModel):
     consistent: bool
     total_in: float
     total_out: float
+    adjustments: float = Field(
+        default=0.0, description="盘点调整流水合计(实盘-系统,可正可负)"
+    )
     available: float
 
 
@@ -249,3 +252,117 @@ class SampleAvailability(BaseModel):
 
 class AvailabilityResponse(BaseModel):
     samples: list[SampleAvailability]
+
+
+# ---------------------------------------------------------------- 盘点
+
+NonNegAmount = Annotated[float, Field(ge=0, description="非负的实盘数量(可为 0)")]
+
+
+class StocktakeItemIn(BaseModel):
+    """建批明细:按样品编号集合建批,余量/单位/版本在服务端事务内取快照。"""
+
+    sample_id: str = Field(min_length=1)
+
+
+class StocktakeRequest(BaseModel):
+    """新增盘点批次:同号同内容幂等重放,同号不同内容 409。"""
+
+    stocktake_no: str = Field(min_length=1, description="盘点批次号(幂等键),全局唯一")
+    items: list[StocktakeItemIn] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+    operator: Optional[str] = Field(default=None, description="建批操作者")
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "StocktakeRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class StocktakeCountIn(BaseModel):
+    """实盘结果明细:逐项给出实盘量(允许为 0,表示盘亏到空)。"""
+
+    sample_id: str = Field(min_length=1)
+    counted_amount: NonNegAmount
+
+
+class StocktakeSubmitRequest(BaseModel):
+    """提交盘点结果:必须逐项覆盖批次内全部样品,不得增减。"""
+
+    operator: Optional[str] = Field(default=None, description="盘点操作者")
+    note: Optional[str] = Field(default=None, description="备注,仅用于审计展示")
+    items: list[StocktakeCountIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "StocktakeSubmitRequest":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
+class StocktakeConfirmRequest(BaseModel):
+    """确认盘点:事务内二次校验版本后写调整流水并改余量;任一项冲突整批不改库存。"""
+
+    operator: str = Field(min_length=1, description="确认操作者(审计必填)")
+    reason: str = Field(min_length=1, description="盘盈/盘亏调整原因(审计必填)")
+
+
+class StocktakeItemOut(BaseModel):
+    sample_id: str
+    unit: str
+    snapshot_remaining: float = Field(description="建批时的系统余量快照")
+    snapshot_version: int = Field(description="建批时的样品版本")
+    counted_amount: Optional[float] = Field(
+        default=None, description="实盘量;未提交为 null"
+    )
+    difference: Optional[float] = Field(
+        default=None, description="差异 = 实盘量 - 提交时系统量;未提交为 null"
+    )
+    submitted_version: Optional[int] = Field(
+        default=None, description="提交实盘时校验通过的样品版本"
+    )
+    current_remaining: Optional[float] = Field(
+        default=None, description="查询时刻的数据库当前余量(未提交阶段用于观察是否已变化)"
+    )
+    current_version: Optional[int] = Field(
+        default=None, description="查询时刻的样品当前版本"
+    )
+    version_drift: bool = Field(
+        description="提交时/查询时样品版本是否已相对建批快照被其他操作改变"
+    )
+    delta_applied: Optional[float] = Field(
+        default=None, description="确认后实际写入调整流水的差异(实盘-确认时系统量)"
+    )
+
+
+class StocktakeAdjustmentOut(BaseModel):
+    sample_id: str
+    unit: str
+    system_amount: float = Field(description="确认时的系统余量")
+    counted_amount: float
+    delta: float = Field(description="写入余量账本的调整量(可正可负)")
+    operator: str
+    reason: str
+    from_version: int
+    to_version: int
+    created_at: str
+
+
+class StocktakeResponse(BaseModel):
+    stocktake_no: str
+    status: Literal["open", "submitted", "confirmed"]
+    items: list[StocktakeItemOut]
+    note: Optional[str] = None
+    operator: Optional[str] = Field(default=None, description="最近一次操作者(建批/提交)")
+    reason: Optional[str] = Field(default=None, description="确认原因(confirmed 后返回)")
+    confirm_operator: Optional[str] = None
+    replayed: bool = Field(
+        default=False, description="True 表示命中批次号幂等,返回首次结果"
+    )
+    adjustments: list[StocktakeAdjustmentOut] = Field(default_factory=list)
+    created_at: Optional[str] = None
+    submitted_at: Optional[str] = None
+    confirmed_at: Optional[str] = None
